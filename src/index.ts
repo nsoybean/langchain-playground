@@ -45,8 +45,7 @@ const URL = process.env.SUPABASE_URL;
 const client = new MongoClient(process.env.MONGODB_ATLAS_URI || "");
 const collection = client.db("langchain").collection("memory");
 // generate a new sessionId string
-// const sessionId = new ObjectId().toString();
-const sessionId = "65643daabcc584e5fa4a5c88";
+const sessionId = "65643daabcc584e5fa4a5c88"; // hardcoded, to test retrieval and update
 
 const memory = new BufferMemory({
   memoryKey: "chat_history",
@@ -122,7 +121,7 @@ async function chat() {
     searchKwargs: { fetchK: 5 },
   });
 
-  // Combine documents prompt:
+  // Combine documents prompt
   const combineDocumentsPromptTemplate = ChatPromptTemplate.fromMessages([
     AIMessagePromptTemplate.fromTemplate(
       "Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.\n\n{context}\n\n"
@@ -164,9 +163,9 @@ async function chat() {
       }
     );
 
-    console.log("🚀 ~ file: index.ts:179 ~ chat ~ result:", result);
+    console.log("🚀 result:", result);
   }
 
-  logger.debug(`🚀 program compeleted`);
+  logger.debug(`🚀 program completed`);
   return;
 }
