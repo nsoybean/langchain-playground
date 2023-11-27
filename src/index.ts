@@ -26,13 +26,13 @@ import { PromptTemplate } from "langchain/prompts";
 import { MongoDBChatMessageHistory } from "langchain/stores/message/mongodb";
 // import { serializeChatHistory } from "../lib/helper";
 import { MongoClient, ObjectId } from "mongodb";
+import { combineDocumentsPromptTemplate } from "./prompts/combineDocumentsPrompt";
 
 const logger = pino({
   level: "debug",
 });
 
 // CONSTANTS
-const PDF_PATH = process.env.PDF_PATH;
 const INPUT_QUESTION = process.env.INPUT_QUESTION;
 
 // CONFIG
@@ -47,21 +47,6 @@ const collection = client.db("langchain").collection("memory");
 // generate a new sessionId string
 const sessionId = "65643daabcc584e5fa4a5c88"; // hardcoded, to test retrieval and update
 
-const memory = new BufferMemory({
-  memoryKey: "chat_history",
-  chatHistory: new MongoDBChatMessageHistory({
-    collection,
-    sessionId,
-  }),
-});
-
-// Initialize the LLM to use to answer the question.
-const model = new ChatOpenAI({
-  modelName: "gpt-3.5-turbo",
-  openAIApiKey: OPENAIAPIKEY,
-  verbose: true, // debugging purposes
-}).pipe(new StringOutputParser());
-
 chat();
 
 // main chat implementation
@@ -70,9 +55,9 @@ async function chat() {
   await client.connect();
 
   // Init
-  if (!PDF_PATH && !INPUT_QUESTION) {
-    logger.fatal(`Expected at least one of PDF_PATH or INPUT_QUESTION`);
-    throw new Error(`Expected at least one of PDF_PATH or INPUT_QUESTION`);
+  if (!INPUT_QUESTION) {
+    logger.fatal(`Expected env var INPUT_QUESTION`);
+    throw new Error(`Expected env var INPUT_QUESTION`);
   }
 
   if (!PRIVATEKEY) {
@@ -99,47 +84,37 @@ async function chat() {
     }
   );
 
-  // parse and embed doc if PDF is provided
-  if (PDF_PATH) {
-    const loader = new PDFLoader(PDF_PATH);
-    const docs = await loader.load();
-    logger.debug(`docs length:, ${docs.length}`);
-
-    const textSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 200,
-      chunkOverlap: 50,
-    });
-    const docsChunks = await textSplitter.splitDocuments(docs);
-    logger.debug(`docsChunks length: ${docsChunks.length}`);
-
-    vectorStore.addDocuments(docsChunks);
-  }
-
   // Initialize a retriever wrapper around the vector store
   const vectorStoreRetriever = vectorStore.asRetriever({
     searchType: "mmr", // Use max marginal relevance search
     searchKwargs: { fetchK: 5 },
   });
 
-  // Combine documents prompt
-  const combineDocumentsPromptTemplate = ChatPromptTemplate.fromMessages([
-    AIMessagePromptTemplate.fromTemplate(
-      "Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.\n\n{context}\n\n"
-    ),
-    new MessagesPlaceholder("chat_history"),
-    HumanMessagePromptTemplate.fromTemplate("Question: {question}"),
-  ]);
+  const memory = new BufferMemory({
+    memoryKey: "chat_history",
+    chatHistory: new MongoDBChatMessageHistory({
+      collection,
+      sessionId,
+    }),
+  });
+
+  // Initialize the LLM to use to answer the question.
+  const model = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    openAIApiKey: OPENAIAPIKEY,
+    verbose: true, // debugging purposes
+  }).pipe(new StringOutputParser());
 
   const conversationalQaChain = RunnableSequence.from([
     {
-      question: (i: { question: string }) => i.question,
+      question: (input: { question: string }) => input.question,
       chat_history: async () => {
         const dbMsgs = await memory.chatHistory.getMessages();
         return dbMsgs;
       },
-      context: async (i: { question: string }) => {
+      context: async (input: { question: string }) => {
         const relevantDocs = await vectorStoreRetriever.getRelevantDocuments(
-          i.question
+          input.question
         );
         return formatDocumentsAsString(relevantDocs);
       },
@@ -149,23 +124,22 @@ async function chat() {
     new StringOutputParser(),
   ]);
 
-  if (INPUT_QUESTION) {
-    const result = await conversationalQaChain.invoke({
-      question: INPUT_QUESTION,
-    });
+  // call
+  const result = await conversationalQaChain.invoke({
+    question: INPUT_QUESTION,
+  });
 
-    await memory.saveContext(
-      {
-        input: INPUT_QUESTION,
-      },
-      {
-        output: result,
-      }
-    );
+  // persist memory
+  await memory.saveContext(
+    {
+      input: INPUT_QUESTION,
+    },
+    {
+      output: result,
+    }
+  );
 
-    console.log("🚀 result:", result);
-  }
-
+  logger.debug("🚀 LLM output:", result);
   logger.debug(`🚀 program completed`);
   return;
 }

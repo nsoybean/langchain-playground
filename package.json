@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "loadDoc": "ts-node-esm src/docLoader.ts  | pino-pretty",
     "start": "ts-node-esm src/index.ts  | pino-pretty",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
