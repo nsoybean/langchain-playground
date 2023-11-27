@@ -10,8 +10,10 @@ import { RetrievalQAChain } from "langchain/chains";
 import { pino } from "pino";
 import { formatDocumentsAsString } from "langchain/util/document";
 import {
+  AIMessagePromptTemplate,
   ChatPromptTemplate,
   HumanMessagePromptTemplate,
+  MessagesPlaceholder,
   SystemMessagePromptTemplate,
 } from "langchain/prompts";
 import {
@@ -20,7 +22,10 @@ import {
 } from "langchain/schema/runnable";
 import { StringOutputParser } from "langchain/schema/output_parser";
 import { BufferMemory } from "langchain/memory";
+import { PromptTemplate } from "langchain/prompts";
+import { MongoDBChatMessageHistory } from "langchain/stores/message/mongodb";
 // import { serializeChatHistory } from "../lib/helper";
+import { MongoClient, ObjectId } from "mongodb";
 
 const logger = pino({
   level: "debug",
@@ -37,14 +42,39 @@ const OPENAIAPIKEY = process.env.OPENAI_API_KEY;
 const PRIVATEKEY = process.env.SUPABASE_PRIVATE_KEY;
 const URL = process.env.SUPABASE_URL;
 
+// const memory = new BufferMemory({
+//   returnMessages: true,
+//   memoryKey: "chat_history",
+// });
+
+const client = new MongoClient(process.env.MONGODB_ATLAS_URI || "");
+const collection = client.db("langchain").collection("memory");
+// generate a new sessionId string
+// const sessionId = new ObjectId().toString();
+const sessionId = "65643daabcc584e5fa4a5c88";
+
 const memory = new BufferMemory({
-  memoryKey: "chatHistory",
+  memoryKey: "chat_history",
+  chatHistory: new MongoDBChatMessageHistory({
+    collection,
+    sessionId,
+  }),
 });
+
+// Initialize the LLM to use to answer the question.
+const model = new ChatOpenAI({
+  modelName: "gpt-3.5-turbo",
+  openAIApiKey: OPENAIAPIKEY,
+  verbose: true, // debugging purposes
+}).pipe(new StringOutputParser());
 
 chat();
 
 // main chat implementation
 async function chat() {
+  // DB
+  await client.connect();
+
   // Init
   if (!PDF_PATH && !INPUT_QUESTION) {
     logger.fatal(`Expected at least one of PDF_PATH or INPUT_QUESTION`);
@@ -92,41 +122,91 @@ async function chat() {
   }
 
   // Initialize a retriever wrapper around the vector store
-  const vectorStoreRetriever = vectorStore.asRetriever();
-
-  // Create a system & human prompt for the chat model
-  const SYSTEM_TEMPLATE = `Use the following pieces of context to answer the question at the end.
-  If you don't know the answer, just say that you don't know, don't try to make up an answer.
-  ----------------
-  {context}`;
-
-  const messages = [
-    SystemMessagePromptTemplate.fromTemplate(SYSTEM_TEMPLATE),
-    HumanMessagePromptTemplate.fromTemplate("{question}"),
-  ];
-  const prompt = ChatPromptTemplate.fromMessages(messages);
-
-  // Initialize the LLM to use to answer the question.
-  const model = new ChatOpenAI({
-    modelName: "gpt-3.5-turbo",
-    openAIApiKey: OPENAIAPIKEY,
-    verbose: true, // debugging purposes
+  const vectorStoreRetriever = vectorStore.asRetriever({
+    searchType: "mmr", // Use max marginal relevance search
+    searchKwargs: { fetchK: 5 },
   });
 
-  // main QA sequence
-  const chain = RunnableSequence.from([
+  /**
+   * Create a prompt template for generating an answer based on context and
+   * a question.
+   *
+   * Chat history will be an empty string if it's the first question.
+   *
+   * inputVariables: ["chatHistory", "context", "question"]
+   */
+  const questionGeneratorTemplate = ChatPromptTemplate.fromMessages([
+    AIMessagePromptTemplate.fromTemplate(
+      "Given the following chat history and a follow up question, rephrase the follow up question to be a standalone question"
+    ),
+    new MessagesPlaceholder("chat_history"),
+    AIMessagePromptTemplate.fromTemplate(`Follow Up Input: {question}
+  Standalone question:`),
+  ]);
+
+  // Combine documents prompt:
+  const combineDocumentsPrompt = ChatPromptTemplate.fromMessages([
+    AIMessagePromptTemplate.fromTemplate(
+      "Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.\n\n{context}\n\n"
+    ),
+    new MessagesPlaceholder("chat_history"),
+    HumanMessagePromptTemplate.fromTemplate("Question: {question}"),
+  ]);
+
+  const combineDocumentsChain = RunnableSequence.from([
     {
-      context: vectorStoreRetriever.pipe(formatDocumentsAsString),
-      question: new RunnablePassthrough(),
+      question: (output: string) => output,
+      chat_history: async () => {
+        const dbMsgs = await memory.chatHistory.getMessages();
+        console.log(
+          "🚀 ~ file: index.ts:170 ~ chat_history: ~ dbMsgs1:",
+          dbMsgs
+        );
+        return dbMsgs;
+      },
+      context: async (output: string) => {
+        const relevantDocs = await vectorStoreRetriever.getRelevantDocuments(
+          output
+        );
+        return formatDocumentsAsString(relevantDocs);
+      },
     },
-    prompt,
+    combineDocumentsPrompt,
     model,
     new StringOutputParser(),
   ]);
 
-  // ask qn
-  const response = await chain.invoke(INPUT_QUESTION);
-  logger.debug(`response: ${JSON.stringify(response)}`);
+  const conversationalQaChain = RunnableSequence.from([
+    {
+      question: (i: { question: string }) => i.question,
+      chat_history: async () => {
+        const dbMsgs = await memory.chatHistory.getMessages();
+        return dbMsgs;
+      },
+    },
+    questionGeneratorTemplate,
+    model,
+    new StringOutputParser(),
+    combineDocumentsChain,
+  ]);
+
+  if (INPUT_QUESTION) {
+    const result = await conversationalQaChain.invoke({
+      question: INPUT_QUESTION,
+    });
+
+    await memory.saveContext(
+      {
+        input: INPUT_QUESTION,
+      },
+      {
+        output: result,
+      }
+    );
+
+    console.log("🚀 ~ file: index.ts:179 ~ chat ~ result:", result);
+  }
 
   logger.debug(`🚀 program compeleted`);
+  return;
 }
