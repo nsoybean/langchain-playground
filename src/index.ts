@@ -42,11 +42,6 @@ const OPENAIAPIKEY = process.env.OPENAI_API_KEY;
 const PRIVATEKEY = process.env.SUPABASE_PRIVATE_KEY;
 const URL = process.env.SUPABASE_URL;
 
-// const memory = new BufferMemory({
-//   returnMessages: true,
-//   memoryKey: "chat_history",
-// });
-
 const client = new MongoClient(process.env.MONGODB_ATLAS_URI || "");
 const collection = client.db("langchain").collection("memory");
 // generate a new sessionId string
@@ -127,53 +122,13 @@ async function chat() {
     searchKwargs: { fetchK: 5 },
   });
 
-  /**
-   * Create a prompt template for generating an answer based on context and
-   * a question.
-   *
-   * Chat history will be an empty string if it's the first question.
-   *
-   * inputVariables: ["chatHistory", "context", "question"]
-   */
-  const questionGeneratorTemplate = ChatPromptTemplate.fromMessages([
-    AIMessagePromptTemplate.fromTemplate(
-      "Given the following chat history and a follow up question, rephrase the follow up question to be a standalone question"
-    ),
-    new MessagesPlaceholder("chat_history"),
-    AIMessagePromptTemplate.fromTemplate(`Follow Up Input: {question}
-  Standalone question:`),
-  ]);
-
   // Combine documents prompt:
-  const combineDocumentsPrompt = ChatPromptTemplate.fromMessages([
+  const combineDocumentsPromptTemplate = ChatPromptTemplate.fromMessages([
     AIMessagePromptTemplate.fromTemplate(
       "Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.\n\n{context}\n\n"
     ),
     new MessagesPlaceholder("chat_history"),
     HumanMessagePromptTemplate.fromTemplate("Question: {question}"),
-  ]);
-
-  const combineDocumentsChain = RunnableSequence.from([
-    {
-      question: (output: string) => output,
-      chat_history: async () => {
-        const dbMsgs = await memory.chatHistory.getMessages();
-        console.log(
-          "🚀 ~ file: index.ts:170 ~ chat_history: ~ dbMsgs1:",
-          dbMsgs
-        );
-        return dbMsgs;
-      },
-      context: async (output: string) => {
-        const relevantDocs = await vectorStoreRetriever.getRelevantDocuments(
-          output
-        );
-        return formatDocumentsAsString(relevantDocs);
-      },
-    },
-    combineDocumentsPrompt,
-    model,
-    new StringOutputParser(),
   ]);
 
   const conversationalQaChain = RunnableSequence.from([
@@ -183,11 +138,16 @@ async function chat() {
         const dbMsgs = await memory.chatHistory.getMessages();
         return dbMsgs;
       },
+      context: async (i: { question: string }) => {
+        const relevantDocs = await vectorStoreRetriever.getRelevantDocuments(
+          i.question
+        );
+        return formatDocumentsAsString(relevantDocs);
+      },
     },
-    questionGeneratorTemplate,
+    combineDocumentsPromptTemplate,
     model,
     new StringOutputParser(),
-    combineDocumentsChain,
   ]);
 
   if (INPUT_QUESTION) {
